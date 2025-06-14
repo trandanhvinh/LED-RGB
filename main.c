@@ -16,11 +16,14 @@
   ****************************************************************************
   */
 /* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
+/* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -28,21 +31,21 @@
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
 #define NUM_LEDS 64
 #define BITS_PER_LED 24
-#define PWM_BUFFER_SIZE (NUM_LEDS * BITS_PER_LED * 3)
+#define PWM_BUFFER_SIZE (NUM_LEDS * BITS_PER_LED * 3) // 3 chu kỳ PWM/bit
 #define HALF_LEDS 63
 #define COLOR_COUNT 4
 #define LEDS_PER_SEGMENT 8
 #define NUM_SEGMENTS 4
 #define TOTAL_STEPS (HALF_LEDS - COLOR_COUNT + 1)
-#define NUM_MODES 4
-#define OLED_ADDRESS 0x3C
+#define NUM_MODES 5 // Thêm Strobe
+#define OLED_ADDRESS 0x3C // Địa chỉ I2C của OLED
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
 #define OLED_PAGE_HEIGHT 8
-
-/* USER CODE BEGIN PD */
+#define ADC_BUFFER_SIZE 64 // Kích thước buffer, điều chỉnh để phù hợp
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -50,8 +53,13 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
 I2C_HandleTypeDef hi2c1;
+
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim3;
 DMA_HandleTypeDef hdma_tim1_ch1;
 
 /* USER CODE BEGIN PV */
@@ -59,11 +67,15 @@ uint8_t led_colors[NUM_LEDS * 3];
 uint16_t pwm_buffer[PWM_BUFFER_SIZE];
 volatile uint8_t dma_complete = 1;
 volatile uint8_t oled_needs_update = 1;
+uint32_t last_update = 0; // Thêm biến mới
+uint32_t adc_buffer[ADC_BUFFER_SIZE];
+volatile uint8_t adc_data_ready = 0;
+volatile uint32_t avg_amplitude = 0; // Thêm biến toàn cục
 
 volatile uint8_t current_mode = 0;
-volatile uint8_t current_speed = 0;
+volatile uint8_t current_speed = 0; // 0: 120ms, 1: 90ms, 2: 70ms, 3: 50ms
 volatile uint8_t current_brightness = 100;
-volatile uint8_t brightness_index = 0;
+volatile uint8_t brightness_index = 0; // Chỉ số cho mảng brightness_levels
 uint8_t rainbow_offset = 0;
 uint8_t fade_direction = 1;
 uint8_t fade_hue = 0;
@@ -73,8 +85,10 @@ uint8_t strobe_hue = 0;
 uint8_t brightness_fade = 0;
 
 const uint16_t speed_delays[] = {120, 90, 70, 50};
-const uint8_t brightness_levels[] = {100, 150, 200, 250};
+const uint8_t brightness_levels[] = {100, 150, 200, 250}; // Mảng chứa các mức độ sáng
 
+// Font 8x8 cho OLED - Định dạng bitmap dọc
+// Mỗi ký tự 8 bytes, mỗi byte đại diện cho 1 cột 8 pixel
 const uint8_t Font8x8[][8] = {
     // Space (32)
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
@@ -168,33 +182,20 @@ const uint8_t Font_8x6_height = 6;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
+void OLED_SetPosition(uint8_t x, uint8_t page);
 static void MX_TIM1_Init(void);
 static void MX_I2C1_Init(void);
-void HSVtoRGB(uint8_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b);
-void SetRainbowEffect(uint8_t *colors, uint8_t offset, uint8_t current_brightness);
-void SetFadeInOutEffect(uint8_t *colors, uint8_t hue, uint8_t brightness_fade);
-void SetPixelRunEffect(uint8_t *colors, uint32_t step, uint8_t current_brightness);
-void SetStrobeEffect(uint8_t *colors, uint8_t current_brightness);
-void WS2812B_SetColor(uint8_t *colors, uint16_t *pwm_buffer);
-void WS2812B_Reset(void);
-void OLED_Init(void);
-void OLED_WriteCommand(uint8_t cmd);
-void OLED_WriteData(uint8_t *data, uint16_t size);
-void OLED_SetPosition(uint8_t x, uint8_t page);
-void OLED_Fill(uint8_t pixel);
-void OLED_DrawChar(uint8_t x, uint8_t page, char c);
-void OLED_DrawString(uint8_t x, uint8_t page, const char *str);
-void OLED_ShowStatus(uint8_t mode, uint8_t speed, uint8_t brightness);
-void update_oled(void);
-
+static void MX_ADC1_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
+void SetAudioEffect(uint8_t *colors, uint32_t amplitude);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 void HSVtoRGB(uint8_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b) {
     uint8_t region, remainder, p, q, t;
-    v = v * current_brightness / 255;
+    v = v * current_brightness / 255; // Áp dụng độ sáng
     if (s == 0) {
         *r = v; *g = v; *b = v;
         return;
@@ -314,6 +315,41 @@ void SetStrobeEffect(uint8_t *colors, uint8_t current_brightness) {
     }
 }
 
+void SetAudioEffect(uint8_t *colors, uint32_t amplitude) {
+    uint8_t r, g, b;
+    for (uint32_t i = 0; i < NUM_LEDS * 3; i++) {
+        colors[i] = 0;
+    }
+
+    uint8_t num_leds = 0;
+    if (amplitude <= 1100) {
+        num_leds = 2;
+        HSVtoRGB(0, 0, 255, &r, &g, &b); // Trắng
+    } else if (amplitude <= 1600) {
+        num_leds = 4;
+        HSVtoRGB(40, 255, 255, &r, &g, &b); // Vàng
+    } else if (amplitude <= 2100) {
+        num_leds = 6;
+        HSVtoRGB(85, 255, 255, &r, &g, &b); // Xanh lá
+    } else {
+        num_leds = 8;
+        HSVtoRGB(0, 255, 255, &r, &g, &b); // Đỏ
+    }
+
+    for (uint8_t col = 0; col < 8; col++) {
+        uint32_t start_idx = col * 8;
+        for (uint8_t led = 0; led < num_leds; led++) {
+            uint32_t led_idx = start_idx + led;
+            if (led_idx < NUM_LEDS) {
+                colors[led_idx * 3 + 0] = g;
+                colors[led_idx * 3 + 1] = r;
+                colors[led_idx * 3 + 2] = b;
+            }
+        }
+    }
+}
+
+
 void WS2812B_SetColor(uint8_t *colors, uint16_t *pwm_buffer) {
     for (uint32_t i = 0; i < NUM_LEDS; i++) {
         for (uint32_t j = 0; j < 24; j++) {
@@ -325,17 +361,17 @@ void WS2812B_SetColor(uint8_t *colors, uint16_t *pwm_buffer) {
 
 void WS2812B_Reset(void) {
     HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-    HAL_Delay(50);
+    HAL_Delay(100); // Tăng lên 100ms
 }
 
 void OLED_WriteCommand(uint8_t cmd) {
-    uint8_t data[2] = {0x00, cmd};
+    uint8_t data[2] = {0x00, cmd}; // 0x00 là Control byte cho lệnh
     HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDRESS << 1, data, 2, 100); // Timeout 100ms
 }
 
 void OLED_WriteData(uint8_t *data, uint16_t size) {
     uint8_t buffer[129];
-    buffer[0] = 0x40;
+    buffer[0] = 0x40; // 0x40 là Control byte cho dữ liệu
     for (uint16_t i = 0; i < size && i < 128; i++) {
         buffer[i + 1] = data[i];
     }
@@ -344,23 +380,23 @@ void OLED_WriteData(uint8_t *data, uint16_t size) {
 
 void OLED_Init(void) {
     HAL_Delay(100);
-    OLED_WriteCommand(0xAE);
-    OLED_WriteCommand(0xD5);
+    OLED_WriteCommand(0xAE); // Tắt màn hình
+    OLED_WriteCommand(0xD5); // Clock
     OLED_WriteCommand(0x80);
-    OLED_WriteCommand(0xA8);
+    OLED_WriteCommand(0xA8); // Multiplex
     OLED_WriteCommand(0x3F);
-    OLED_WriteCommand(0xD3);
+    OLED_WriteCommand(0xD3); // Offset
     OLED_WriteCommand(0x00);
-    OLED_WriteCommand(0x40);
-    OLED_WriteCommand(0x8D);
+    OLED_WriteCommand(0x40); // Start line
+    OLED_WriteCommand(0x8D); // Charge pump
     OLED_WriteCommand(0x14);
-    OLED_WriteCommand(0xA0);
-    OLED_WriteCommand(0xC0);
-    OLED_WriteCommand(0xDA);
+    OLED_WriteCommand(0xA0); // Segment remap bình thường
+    OLED_WriteCommand(0xC0); // COM scan từ trên xuống
+    OLED_WriteCommand(0xDA); // Pins
     OLED_WriteCommand(0x12);
-    OLED_WriteCommand(0x20);
-    OLED_WriteCommand(0x02);
-    OLED_WriteCommand(0xAF);
+    OLED_WriteCommand(0x20); // Memory mode
+    OLED_WriteCommand(0x02); // Page addressing mode
+    OLED_WriteCommand(0xAF); // Bật màn hình
 }
 
 void OLED_Fill(uint8_t pixel) {
@@ -373,28 +409,31 @@ void OLED_Fill(uint8_t pixel) {
 }
 
 void OLED_SetPosition(uint8_t x, uint8_t page) {
-    OLED_WriteCommand(0xB0 | page);
-    OLED_WriteCommand(0x00 | (x & 0x0F));
-    OLED_WriteCommand(0x10 | ((x >> 4) & 0x0F));
+    OLED_WriteCommand(0xB0 | page); // Đặt page
+    OLED_WriteCommand(0x00 | (x & 0x0F)); // Đặt cột thấp
+    OLED_WriteCommand(0x10 | ((x >> 4) & 0x0F)); // Đặt cột cao
 }
 
+// Hàm lấy font data theo ký tự
 const uint8_t* GetFontData(char c) {
-    if (c == ' ') return Font8x8[0];
+    if (c == ' ') return Font8x8[0];      // Space
     else if (c >= 'A' && c <= 'Z') return Font8x8[c - 'A' + 1];
     else if (c >= '0' && c <= '9') return Font8x8[c - '0' + 27];
     else if (c == ':') return Font8x8[37];
     else if (c == '=') return Font8x8[38];
     else if (c == 'm') return Font8x8[39];
     else if (c == 's') return Font8x8[40];
-    else return Font8x8[0];
+    else return Font8x8[0]; // Default to space
 }
 
+// Cập nhật hàm vẽ ký tự
 void OLED_DrawChar(uint8_t x, uint8_t page, char c) {
     const uint8_t* font_data = GetFontData(c);
     OLED_SetPosition(x, page);
     OLED_WriteData((uint8_t*)font_data, 8);
 }
 
+// Cập nhật hàm vẽ chuỗi
 void OLED_DrawString(uint8_t x, uint8_t page, const char *str) {
     uint8_t pos_x = x;
     while (*str && pos_x + 8 <= OLED_WIDTH) {
@@ -404,30 +443,36 @@ void OLED_DrawString(uint8_t x, uint8_t page, const char *str) {
     }
 }
 
+// Cập nhật hàm hiển thị trạng thái
 void OLED_ShowStatus(uint8_t mode, uint8_t speed, uint8_t brightness) {
     char buf[20];
     const char *mode_names[] = {"RAINBOW", "FADE", "PIXELRUN", "STROBE"};
 
-    OLED_Fill(0);
+    OLED_Fill(0); // Xóa màn hình
 
+    // Hiển thị chế độ
     sprintf(buf, "MODE: %s", mode_names[mode]);
     OLED_DrawString(0, 0, buf);
 
+    // Hiển thị tốc độ
     sprintf(buf, "SPEED: %dms", speed_delays[speed]);
     OLED_DrawString(0, 2, buf);
 
+    // Hiển thị độ sáng
     sprintf(buf, "BRIGHT: %d", brightness_levels[brightness]);
     OLED_DrawString(0, 4, buf);
 }
 
+// Cập nhật hàm hiển thị khởi động
 void OLED_ShowStartup(void) {
     OLED_Init();
-    OLED_Fill(0);
+    OLED_Fill(0); // Xóa màn hình
     OLED_DrawString(0, 1, "LED CONTROLLER");
     OLED_DrawString(0, 3, "INIT COMPLETE");
     HAL_Delay(1000);
 }
 
+// Cập nhật hàm update OLED
 void update_oled(void) {
     OLED_ShowStatus(current_mode, current_speed, brightness_index);
 }
@@ -439,14 +484,35 @@ void update_oled(void) {
   */
 int main(void)
 {
-    HAL_Init();
-    SystemClock_Config();
-    MX_GPIO_Init();
-    MX_DMA_Init();
-    MX_TIM1_Init();
-    MX_I2C1_Init();
 
-    /* USER CODE BEGIN 2 */
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_TIM1_Init();
+  MX_I2C1_Init();
+  MX_ADC1_Init();
+  MX_TIM3_Init();
+  /* USER CODE BEGIN 2 */
     OLED_Init();
     OLED_ShowStartup();
     update_oled();
@@ -462,10 +528,15 @@ int main(void)
     }
     dma_complete = 0;
     HAL_Delay(1000);
-    /* USER CODE END 2 */
 
-    /* Infinite loop */
-    /* USER CODE BEGIN WHILE */
+    HAL_TIM_Base_Start(&htim3);
+    if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, ADC_BUFFER_SIZE) != HAL_OK) {
+        Error_Handler();
+    }
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
     while (1)
     {
         if (dma_complete && HAL_DMA_GetState(&hdma_tim1_ch1) == HAL_DMA_STATE_READY) {
@@ -474,6 +545,7 @@ int main(void)
             HAL_Delay(1);
             WS2812B_Reset();
 
+            // Chọn hiệu ứng dựa trên current_mode
             switch (current_mode) {
                 case 0:
                     SetRainbowEffect(led_colors, rainbow_offset++, current_brightness);
@@ -506,7 +578,11 @@ int main(void)
                 case 3:
                     SetStrobeEffect(led_colors, current_brightness);
                     break;
+                case 4:
+                    SetAudioEffect(led_colors, avg_amplitude); // Sử dụng giá trị toàn cục
+                    break;
             }
+
             WS2812B_SetColor(led_colors, pwm_buffer);
             if (HAL_TIM_PWM_Start_DMA(&htim1, TIM_CHANNEL_1, (uint32_t *)pwm_buffer, PWM_BUFFER_SIZE) != HAL_OK) {
                 HAL_DMA_Abort(&hdma_tim1_ch1);
@@ -517,12 +593,15 @@ int main(void)
                 oled_needs_update = 0;
             }
         }
-        HAL_Delay(speed_delays[current_speed]);
-        /* USER CODE END WHILE */
+        // Điều khiển tốc độ bằng thời gian không chặn
+            if (HAL_GetTick() - last_update >= speed_delays[current_speed]) {
+                last_update = HAL_GetTick();
+            }
+    /* USER CODE END WHILE */
 
-        /* USER CODE BEGIN 3 */
+    /* USER CODE BEGIN 3 */
     }
-    /* USER CODE END 3 */
+  /* USER CODE END 3 */
 }
 
 /**
@@ -531,36 +610,72 @@ int main(void)
   */
 void SystemClock_Config(void)
 {
-    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-    __HAL_RCC_PWR_CLK_ENABLE();
-    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-    RCC_OscInitStruct.PLL.PLLM = 4;
-    RCC_OscInitStruct.PLL.PLLN = 168;
-    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-    RCC_OscInitStruct.PLL.PLLQ = 4;
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-    {
-        Error_Handler();
-    }
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 168;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                                |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
-    {
-        Error_Handler();
-    }
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+
+    hadc1.Instance = ADC1;
+    hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+    hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+    hadc1.Init.ScanConvMode = DISABLE;
+    hadc1.Init.ContinuousConvMode = DISABLE;
+    hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+    hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T3_TRGO;
+    hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc1.Init.NbrOfConversion = 1;
+    hadc1.Init.DMAContinuousRequests = ENABLE;
+    hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
+
+    sConfig.Channel = ADC_CHANNEL_3;
+    sConfig.Rank = 1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
 }
 
 /**
@@ -570,19 +685,31 @@ void SystemClock_Config(void)
   */
 static void MX_I2C1_Init(void)
 {
-    hi2c1.Instance = I2C1;
-    hi2c1.Init.ClockSpeed = 400000;
-    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-    hi2c1.Init.OwnAddress1 = 0;
-    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-    hi2c1.Init.OwnAddress2 = 0;
-    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-    {
-        Error_Handler();
-    }
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 400000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
 }
 
 /**
@@ -592,60 +719,117 @@ static void MX_I2C1_Init(void)
   */
 static void MX_TIM1_Init(void)
 {
-    TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-    TIM_MasterConfigTypeDef sMasterConfig = {0};
-    TIM_OC_InitTypeDef sConfigOC = {0};
-    TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
 
-    htim1.Instance = TIM1;
-    htim1.Init.Prescaler = 1;
-    htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim1.Init.Period = 104;
-    htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-    htim1.Init.RepetitionCounter = 0;
-    htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
-    {
-        Error_Handler();
-    }
-    sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-    if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
-    {
-        Error_Handler();
-    }
-    if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
-    {
-        Error_Handler();
-    }
-    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-    {
-        Error_Handler();
-    }
-    sConfigOC.OCMode = TIM_OCMODE_PWM1;
-    sConfigOC.Pulse = 0;
-    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-    sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-    sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-    sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-    {
-        Error_Handler();
-    }
-    sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
-    sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
-    sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-    sBreakDeadTimeConfig.DeadTime = 0;
-    sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
-    sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-    sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-    if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
-    {
-        Error_Handler();
-    }
-    HAL_TIM_MspPostInit(&htim1);
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 1;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 104;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 2624;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 1;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
 }
 
 /**
@@ -653,9 +837,18 @@ static void MX_TIM1_Init(void)
   */
 static void MX_DMA_Init(void)
 {
-    __HAL_RCC_DMA2_CLK_ENABLE();
-    HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+  /* DMA2_Stream1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
+
 }
 
 /**
@@ -665,33 +858,47 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    __HAL_RCC_GPIOH_CLK_ENABLE();
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-    __HAL_RCC_GPIOB_CLK_ENABLE();
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
 
-    GPIO_InitStruct.Pin = MODE_BTN_Pin|SPEED_BTN_Pin|BRIGHTNESS_BTN_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  /* USER CODE END MX_GPIO_Init_1 */
 
-    HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
-    HAL_NVIC_SetPriority(EXTI1_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(EXTI1_IRQn);
-    HAL_NVIC_SetPriority(EXTI2_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(EXTI2_IRQn);
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pins : MODE_BTN_Pin SPEED_BTN_Pin BRIGHTNESS_BTN_Pin */
+  GPIO_InitStruct.Pin = MODE_BTN_Pin|SPEED_BTN_Pin|BRIGHTNESS_BTN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI2_IRQn);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     static uint32_t last_press = 0;
-    if (HAL_GetTick() - last_press < 500) return; // Giảm debounce xuống 100ms
+    if (HAL_GetTick() - last_press < 500) return;
     last_press = HAL_GetTick();
 
     if (GPIO_Pin == MODE_BTN_Pin) {
-        current_mode = (current_mode + 1) % NUM_MODES;
+        current_mode = (current_mode + 1) % NUM_MODES; // Tăng mode lên 5
         animation_step = 0;
         strobe_state = 0;
         strobe_hue = 0;
@@ -700,8 +907,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         current_speed = (current_speed + 1) % 4;
         oled_needs_update = 1;
     } else if (GPIO_Pin == BRIGHTNESS_BTN_Pin) {
-        brightness_index = (brightness_index + 1) % 4; // Tăng chỉ số, quay lại 0 nếu vượt 3
-        current_brightness = brightness_levels[brightness_index]; // Cập nhật độ sáng
+        brightness_index = (brightness_index + 1) % 4;
+        current_brightness = brightness_levels[brightness_index];
         oled_needs_update = 1;
     }
 }
@@ -719,6 +926,21 @@ void HAL_DMA_ErrorCallback(DMA_HandleTypeDef *hdma) {
         HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
     }
 }
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+    if (hadc->Instance == ADC1) {
+        uint32_t sum_squares = 0;
+        const uint32_t offset = 2048; // DC offset của MAX9814 (~1.65V)
+        for (uint32_t i = 0; i < ADC_BUFFER_SIZE; i++) {
+            int32_t sample = (int32_t)adc_buffer[i] - offset;
+            sum_squares += sample * sample;
+        }
+        float rms = sqrt((float)sum_squares / ADC_BUFFER_SIZE);
+        avg_amplitude = (uint32_t)(rms * 2.0f); // Nhân 2 để ước lượng peak
+        if (avg_amplitude > 2000) avg_amplitude = 3500; // Giới hạn
+        adc_data_ready = 1;
+    }
+}
 /* USER CODE END 4 */
 
 /**
@@ -727,10 +949,13 @@ void HAL_DMA_ErrorCallback(DMA_HandleTypeDef *hdma) {
   */
 void Error_Handler(void)
 {
-    __disable_irq();
-    while (1)
-    {
-    }
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT
@@ -743,9 +968,9 @@ void Error_Handler(void)
   */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-    /* USER CODE BEGIN 6 */
+  /* USER CODE BEGIN 6 */
     /* User can add his own implementation to report the file name and line number,
        ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-    /* USER CODE END 6 */
+  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
